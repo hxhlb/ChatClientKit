@@ -147,7 +147,11 @@ struct AppleIntelligenceToolProxyTests {
             Issue.record("Expected invocation capture error")
         } catch let AppleIntelligenceToolError.invocationCaptured(request) {
             #expect(request.name == "lookupWeather")
-            #expect(request.args == #"{"city":"Paris"}"#)
+            let data = try #require(request.args.data(using: .utf8))
+            let arguments = try #require(
+                JSONSerialization.jsonObject(with: data) as? [String: String]
+            )
+            #expect(arguments == ["city": "Paris"])
         } catch {
             Issue.record("Unexpected error: \(error)")
         }
