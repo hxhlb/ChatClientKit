@@ -99,7 +99,13 @@ struct AppleIntelligencePromptBuilderTests {
     func `makePrompt prioritizes latest user message`() {
         let messages: [ChatRequestBody.Message] = [
             .user(content: .text("First question")),
-            .assistant(content: .text("First answer")),
+            .assistant(
+                content: .text("First answer"),
+                toolCalls: [.init(
+                    id: "call_1",
+                    function: .init(name: "lookup", arguments: #"{"query":"weather"}"#)
+                )]
+            ),
             .tool(content: .text("tool output"), toolCallID: "call_1"),
             .user(content: .text("Latest question"), name: "Alex"),
         ]
@@ -109,8 +115,37 @@ struct AppleIntelligencePromptBuilderTests {
         #expect(prompt.contains("Conversation so far"))
         #expect(prompt.contains("User: First question"))
         #expect(prompt.contains("Assistant: First answer"))
+        #expect(prompt.contains(#"Assistant tool call (call_1): lookup({"query":"weather"})"#))
         #expect(prompt.contains("Tool(call_1): tool output"))
         #expect(prompt.contains("User (Alex): Latest question"))
+    }
+}
+
+struct AppleIntelligenceStreamStateTests {
+    @Test
+    func `Text deltas remain ordered before a captured tool call`() {
+        var state = AppleIntelligenceStreamState()
+        let request = ToolRequest(id: "call-id", name: "lookup", args: #"{"city":"Paris"}"#)
+
+        let chunks = [
+            state.textChunk(for: "Checking"),
+            state.textChunk(for: "Checking now."),
+            state.toolChunk(for: request),
+        ].compactMap { $0 }
+
+        #expect(chunks == [
+            .text("Checking"),
+            .text(" now."),
+            .tool(request),
+        ])
+    }
+
+    @Test
+    func `Repeated cumulative text does not duplicate output`() {
+        var state = AppleIntelligenceStreamState()
+
+        #expect(state.textChunk(for: "Ready") == .text("Ready"))
+        #expect(state.textChunk(for: "Ready") == nil)
     }
 }
 
@@ -160,13 +195,13 @@ struct AppleIntelligenceToolProxyTests {
     @Test
     @available(iOS 26.0, macOS 26, macCatalyst 26.0, *)
     func `Specific tool choice exposes only the selected function`() throws {
-        let client = AppleIntelligenceChatClient()
         let tools: [ChatRequestBody.Tool] = [
             .function(name: "weather", description: nil, parameters: nil, strict: nil),
             .function(name: "calendar", description: nil, parameters: nil, strict: nil),
         ]
+        let body = ChatRequestBody(tools: tools, toolChoice: .function(name: "calendar"))
 
-        let selected = try client.selectTools(tools, choice: .function(name: "calendar"))
+        let selected = try body.selectedTools()
 
         #expect(selected.count == 1)
         guard case let .function(name, _, _, _) = selected[0] else {
@@ -179,11 +214,33 @@ struct AppleIntelligenceToolProxyTests {
     @Test
     @available(iOS 26.0, macOS 26, macCatalyst 26.0, *)
     func `Required tool choice rejects an empty tool list`() {
-        let client = AppleIntelligenceChatClient()
+        let body = ChatRequestBody(toolChoice: .required)
 
         #expect(throws: Error.self) {
-            _ = try client.selectTools([], choice: .required)
+            _ = try body.selectedTools()
         }
+    }
+
+    @Test
+    @available(iOS 27.0, macOS 27.0, macCatalyst 27.0, *)
+    func `Required tool choice reaches native generation options`() throws {
+        let client = AppleIntelligenceChatClient()
+        let body = ChatRequestBody(
+            messages: [.user(content: .text("Check Paris weather"))],
+            maxCompletionTokens: 48,
+            tools: [.function(
+                name: "weather",
+                description: "Look up weather.",
+                parameters: nil,
+                strict: nil
+            )],
+            toolChoice: .function(name: "weather")
+        )
+
+        let context = try client.makeSessionContext(body: body, persona: "")
+
+        #expect(context.options.maximumResponseTokens == 48)
+        #expect(context.options.toolCallingMode == .required)
     }
 }
 
@@ -270,18 +327,19 @@ struct AppleIntelligenceIntegrationTests {
             ],
             maxCompletionTokens: 100,
             temperature: 0.5,
-            tools: tools
+            tools: tools,
+            toolChoice: .function(name: "get_weather")
         )
 
-        let response: ChatResponse = try await client.chat(body: body)
-
-        if let tool = response.tools.first {
-            print("✅ Tool call test passed. Generated tool call \(tool.name) args: \(tool.args)")
-        } else if !response.text.isEmpty {
-            print("⚠️ Model did not generate tool calls (may respond directly instead)")
-            print("  Response content: \(response.text)")
-        } else {
-            Issue.record("No tool call or text content returned.")
+        let stream = try await client.streamingChat(body: body)
+        var chunks: [ChatResponseChunk] = []
+        for try await chunk in stream {
+            chunks.append(chunk)
         }
+
+        let toolIndex = try #require(chunks.firstIndex(where: { $0.toolValue != nil }))
+        let tool = try #require(chunks[toolIndex].toolValue)
+        #expect(tool.name == "get_weather")
+        #expect(chunks[(toolIndex + 1)...].isEmpty)
     }
 }

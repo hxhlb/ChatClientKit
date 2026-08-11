@@ -19,9 +19,10 @@ extension MLXChatClient {
         return body
     }
 
-    func userInput(body: ChatRequestBody) -> UserInput {
+    func userInput(body: ChatRequestBody) throws -> UserInput {
         var messages: [[String: any Sendable]] = []
         var images: [UserInput.Image] = []
+        var toolNamesByCallID: [String: String] = [:]
         for message in body.messages {
             switch message {
             case let .assistant(content, toolCalls, _):
@@ -29,12 +30,13 @@ extension MLXChatClient {
                 if let content { msg["content"] = userInputContent(for: content) }
                 if let toolCalls, !toolCalls.isEmpty {
                     msg["tool_calls"] = toolCalls.map { tc -> [String: any Sendable] in
-                        [
+                        toolNamesByCallID[tc.id] = tc.function.name
+                        return [
                             "type": "function",
                             "id": tc.id,
                             "function": [
                                 "name": tc.function.name,
-                                "arguments": tc.function.arguments ?? "",
+                                "arguments": decodedToolArguments(tc.function.arguments),
                             ] as [String: any Sendable],
                         ]
                     }
@@ -43,12 +45,19 @@ extension MLXChatClient {
             case let .system(content, _):
                 let msg: [String: any Sendable] = ["role": "system", "content": userInputContent(for: content)]
                 messages.append(msg)
+            case let .developer(content, _):
+                let msg: [String: any Sendable] = ["role": "system", "content": userInputContent(for: content)]
+                messages.append(msg)
             case let .tool(content, toolCallID):
-                messages.append([
+                var msg: [String: any Sendable] = [
                     "role": "tool",
                     "content": userInputContent(for: content),
                     "tool_call_id": toolCallID,
-                ])
+                ]
+                if let name = toolNamesByCallID[toolCallID] {
+                    msg["name"] = name
+                }
+                messages.append(msg)
             case let .user(content, _):
                 switch content {
                 case let .text(text):
@@ -96,19 +105,21 @@ extension MLXChatClient {
                         }
                     }
                 }
-            default:
-                continue
             }
         }
-        let tools = convertToToolSpecs(body.tools)
+        let selectedTools = try body.selectedTools()
+        if let directive = body.toolChoiceDirective {
+            appendSystemDirective(directive, to: &messages)
+        }
+        let tools = convertToToolSpecs(selectedTools)
         return .init(messages: messages, images: images, tools: tools)
     }
 
     func generateParameters(body: ChatRequestBody) -> GenerateParameters {
         var parameters = GenerateParameters()
         parameters.maxTokens = max(body.maxCompletionTokens ?? 4096, 1)
-        if let temperature = body.temperature {
-            parameters.temperature = Float(temperature)
+        if let temperature = body.temperature, temperature.isFinite {
+            parameters.temperature = Float(min(max(temperature, 0), 2))
         }
         return parameters
     }
@@ -138,20 +149,70 @@ extension MLXChatClient {
         }
     }
 
-    func convertToToolSpecs(_ tools: [ChatRequestBody.Tool]?) -> [[String: any Sendable]]? {
-        guard let tools, !tools.isEmpty else { return nil }
+    func convertToToolSpecs(_ tools: [ChatRequestBody.Tool]) -> [[String: any Sendable]]? {
+        guard !tools.isEmpty else { return nil }
         return tools.map { tool -> [String: any Sendable] in
             switch tool {
             case let .function(name, description, parameters, strict):
-                var function: [String: any Sendable] = ["name": name]
-                if let description { function["description"] = description }
-                if let parameters { function["parameters"] = anyCodingValueToSendable(.object(parameters)) }
+                var function: [String: any Sendable] = [
+                    "name": name,
+                    "description": description ?? "",
+                    "parameters": anyCodingValueToSendable(.object(parameters ?? [
+                        "type": "object",
+                        "properties": [:],
+                    ])),
+                ]
                 if let strict { function["strict"] = strict }
                 return [
                     "type": "function",
                     "function": function,
                 ]
             }
+        }
+    }
+
+    private func decodedToolArguments(_ arguments: String?) -> any Sendable {
+        guard let arguments,
+              let data = arguments.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any]
+        else {
+            return [String: any Sendable]()
+        }
+        return dictionary.mapValues(jsonValueToSendable)
+    }
+
+    private func jsonValueToSendable(_ value: Any) -> any Sendable {
+        switch value {
+        case is NSNull:
+            NSNull()
+        case let value as Bool:
+            value
+        case let value as Int:
+            value
+        case let value as Double:
+            value
+        case let value as String:
+            value
+        case let value as [Any]:
+            value.map(jsonValueToSendable)
+        case let value as [String: Any]:
+            value.mapValues(jsonValueToSendable)
+        default:
+            String(describing: value)
+        }
+    }
+
+    private func appendSystemDirective(
+        _ directive: String,
+        to messages: inout [[String: any Sendable]]
+    ) {
+        if let index = messages.firstIndex(where: { $0["role"] as? String == "system" }),
+           let content = messages[index]["content"] as? String
+        {
+            messages[index]["content"] = content + "\n" + directive
+        } else {
+            messages.insert(["role": "system", "content": directive], at: 0)
         }
     }
 

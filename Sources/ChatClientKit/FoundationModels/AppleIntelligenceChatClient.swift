@@ -47,13 +47,13 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
         body: ChatRequestBody,
         persona: String
     ) throws -> SessionContext {
-        let selectedTools = try selectTools(body.tools, choice: body.toolChoice)
+        let selectedTools = try body.selectedTools()
         let tools = try makeToolProxies(from: selectedTools)
 
         let instructionText = AppleIntelligencePromptBuilder.makeInstructions(
             persona: persona,
             messages: body.messages,
-            additionalDirectives: toolChoiceInstructions(body.toolChoice)
+            additionalDirectives: body.toolChoiceDirective.map { [$0] } ?? []
         )
 
         let prompt = AppleIntelligencePromptBuilder.makePrompt(from: body.messages)
@@ -91,30 +91,6 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
         return SessionContext(session: session, prompt: prompt, options: options)
     }
 
-    func selectTools(
-        _ tools: [ChatRequestBody.Tool]?,
-        choice: ChatRequestBody.ToolChoice?
-    ) throws -> [ChatRequestBody.Tool] {
-        let tools = tools ?? []
-        guard case let .function(selectedName) = choice else {
-            if case .required = choice, tools.isEmpty {
-                throw invalidToolChoiceError(
-                    String(localized: "A required tool choice needs at least one tool.")
-                )
-            }
-            return tools
-        }
-
-        guard let selected = tools.first(where: { tool in
-            guard case let .function(name, _, _, _) = tool else { return false }
-            return name == selectedName
-        }) else {
-            let key: String.LocalizationValue = "The selected tool '\(selectedName)' is not available."
-            throw invalidToolChoiceError(String(localized: key))
-        }
-        return [selected]
-    }
-
     func makeToolProxies(
         from tools: [ChatRequestBody.Tool]
     ) throws -> [any Tool] {
@@ -130,31 +106,12 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
         }
     }
 
-    func toolChoiceInstructions(_ choice: ChatRequestBody.ToolChoice?) -> [String] {
-        switch choice {
-        case .required:
-            ["Call one of the available tools before answering the user."]
-        case let .function(name):
-            ["Call the \(name) tool. Do not answer the user directly."]
-        case .auto, nil:
-            []
-        }
-    }
-
     func clampTemperature(_ value: Double) -> Double {
         let fallback = configuration.defaultTemperature.isFinite
             ? configuration.defaultTemperature
             : 0.75
         guard value.isFinite else { return min(max(fallback, 0), 2) }
         return min(max(value, 0), 2)
-    }
-
-    private func invalidToolChoiceError(_ description: String) -> NSError {
-        NSError(
-            domain: "AppleIntelligence",
-            code: -2,
-            userInfo: [NSLocalizedDescriptionKey: description]
-        )
     }
 
     func makeStreamingSequence(
@@ -178,25 +135,15 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
 
         return AnyAsyncSequence(AsyncThrowingStream { continuation in
             let task = Task {
+                var streamState = AppleIntelligenceStreamState()
                 do {
-                    var accumulated = ""
                     for try await partial in context.session.streamResponse(
                         to: context.prompt,
                         options: context.options
                     ) {
-                        let fullText = partial.content
-                        guard fullText.count >= accumulated.count else {
-                            accumulated = ""
-                            continue
+                        if let chunk = streamState.textChunk(for: partial.content) {
+                            continuation.yield(chunk)
                         }
-
-                        let deltaStart = fullText.index(fullText.startIndex, offsetBy: accumulated.count)
-                        let newContent = String(fullText[deltaStart...])
-                        accumulated = fullText
-
-                        guard !newContent.isEmpty else { continue }
-
-                        continuation.yield(.text(newContent))
                     }
                     continuation.finish()
                 } catch is CancellationError {
@@ -208,7 +155,7 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
                     }
                     switch invocationError {
                     case let .invocationCaptured(request):
-                        continuation.yield(.tool(request))
+                        continuation.yield(streamState.toolChunk(for: request))
                         continuation.finish()
                     }
                 } catch {
@@ -220,5 +167,28 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
                 task.cancel()
             }
         })
+    }
+}
+
+struct AppleIntelligenceStreamState {
+    private var accumulatedText = ""
+
+    mutating func textChunk(for fullText: String) -> ChatResponseChunk? {
+        guard fullText.hasPrefix(accumulatedText) else {
+            accumulatedText = fullText
+            return nil
+        }
+
+        let deltaStart = fullText.index(
+            fullText.startIndex,
+            offsetBy: accumulatedText.count
+        )
+        let delta = String(fullText[deltaStart...])
+        accumulatedText = fullText
+        return delta.isEmpty ? nil : .text(delta)
+    }
+
+    func toolChunk(for request: ToolRequest) -> ChatResponseChunk {
+        .tool(request)
     }
 }

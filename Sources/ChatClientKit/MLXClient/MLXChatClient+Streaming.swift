@@ -25,14 +25,16 @@ extension MLXChatClient {
         body: ChatRequestBody,
         token: UUID
     ) async throws -> AnyAsyncSequence<ChatResponseChunk> {
-        var userInput = userInput(body: body)
+        var userInput = try userInput(body: body)
         let generateParameters = generateParameters(body: body)
         let container = try await loadContainer(adjusting: &userInput)
         let toolSpecs = userInput.tools
         return try await container.perform(nonSendable: userInput) { context, lockedInput in
             let input = try await context.processor.prepare(input: lockedInput)
 
-            let toolCallFormat = context.configuration.toolCallFormat ?? .json
+            let toolCallFormat = modelConfiguration.toolCallFormat
+                ?? context.configuration.toolCallFormat
+                ?? .json
             let streamInput = UnsafeSendableBox(input)
             let streamContext = UnsafeSendableBox(context)
             let streamParameters = generateParameters
@@ -45,11 +47,11 @@ extension MLXChatClient {
                     let input = streamInput.value
                     let context = streamContext.value
 
-                    let toolProcessor: ToolCallProcessor? = if let streamToolSpecs, !streamToolSpecs.isEmpty {
-                        ToolCallProcessor(format: toolCallFormat, tools: streamToolSpecs)
-                    } else {
-                        nil
-                    }
+                    var toolStream = MLXToolStreamState(
+                        format: toolCallFormat,
+                        tools: streamToolSpecs,
+                        toolChoice: body.toolChoice
+                    )
 
                     var latestOutputLength = 0
                     var shouldRemoveLeadingWhitespace = true
@@ -83,19 +85,8 @@ extension MLXChatClient {
                             )
 
                             if let generatedChunk = decodeResult.chunk {
-                                for choice in generatedChunk.choices {
-                                    if let reasoning = choice.delta.reasoningContent {
-                                        continuation.yield(ChatResponseChunk.reasoning(reasoning))
-                                    }
-                                    if let content = choice.delta.content {
-                                        if let toolProcessor {
-                                            if let passthrough = toolProcessor.processChunk(content) {
-                                                continuation.yield(ChatResponseChunk.text(passthrough))
-                                            }
-                                        } else {
-                                            continuation.yield(ChatResponseChunk.text(content))
-                                        }
-                                    }
+                                for chunk in toolStream.process(generatedChunk) {
+                                    continuation.yield(chunk)
                                 }
                             }
 
@@ -113,49 +104,20 @@ extension MLXChatClient {
                             previousLength: latestOutputLength,
                             shouldRemoveLeadingWhitespace: &shouldRemoveLeadingWhitespace
                         ) {
-                            for choice in finalChunk.choices {
-                                if let reasoning = choice.delta.reasoningContent {
-                                    continuation.yield(ChatResponseChunk.reasoning(reasoning))
-                                }
-                                if let content = choice.delta.content {
-                                    if let toolProcessor {
-                                        if let passthrough = toolProcessor.processChunk(content) {
-                                            continuation.yield(ChatResponseChunk.text(passthrough))
-                                        }
-                                    } else {
-                                        continuation.yield(ChatResponseChunk.text(content))
-                                    }
-                                }
+                            for chunk in toolStream.process(finalChunk) {
+                                continuation.yield(chunk)
                             }
                         }
                         if let finalChunk = decoder.finalize(
                             shouldRemoveLeadingWhitespace: &shouldRemoveLeadingWhitespace
                         ) {
-                            for choice in finalChunk.choices {
-                                if let reasoning = choice.delta.reasoningContent {
-                                    continuation.yield(.reasoning(reasoning))
-                                }
-                                if let content = choice.delta.content {
-                                    if let toolProcessor {
-                                        if let passthrough = toolProcessor.processChunk(content) {
-                                            continuation.yield(.text(passthrough))
-                                        }
-                                    } else {
-                                        continuation.yield(.text(content))
-                                    }
-                                }
+                            for chunk in toolStream.process(finalChunk) {
+                                continuation.yield(chunk)
                             }
                         }
 
-                        if let toolProcessor {
-                            for toolCall in toolProcessor.toolCalls {
-                                let argsJSON = toolCallArgsToJSON(toolCall.function.arguments)
-                                let request = ToolRequest(
-                                    name: toolCall.function.name,
-                                    args: argsJSON
-                                )
-                                continuation.yield(ChatResponseChunk.tool(request))
-                            }
+                        for chunk in toolStream.finish() {
+                            continuation.yield(chunk)
                         }
 
                         logger.info("inference completed, total output length: \(output.count)")
@@ -177,6 +139,140 @@ extension MLXChatClient {
                 }
             }
         }.eraseToAnyAsyncSequence()
+    }
+}
+
+@available(iOS 17.0, macOS 14.0, macCatalyst 17.0, *)
+struct MLXToolStreamState {
+    private let processor: ToolCallProcessor?
+    private let inferredMistralToolName: String?
+    private var pendingMistralOutputs: [ToolCallProcessor.Output] = []
+
+    init(
+        format: ToolCallFormat,
+        tools: [[String: any Sendable]]?,
+        toolChoice: ChatRequestBody.ToolChoice? = nil
+    ) {
+        processor = if let tools, !tools.isEmpty {
+            ToolCallProcessor(format: format, tools: tools)
+        } else {
+            nil
+        }
+        let requiresTool = switch toolChoice {
+        case .required, .function: true
+        case .auto, nil: false
+        }
+        inferredMistralToolName = if format == .mistral,
+                                    requiresTool,
+                                    let tools,
+                                    tools.count == 1,
+                                    let function = tools[0]["function"] as? [String: any Sendable]
+        {
+            function["name"] as? String
+        } else {
+            nil
+        }
+    }
+
+    mutating func process(_ generatedChunk: ChatCompletionChunk) -> [ChatResponseChunk] {
+        generatedChunk.choices.flatMap { choice in
+            var chunks: [ChatResponseChunk] = []
+            if let reasoning = choice.delta.reasoningContent {
+                chunks.append(.reasoning(reasoning))
+            }
+            guard let content = choice.delta.content else { return chunks }
+            guard let processor else {
+                chunks.append(.text(content))
+                return chunks
+            }
+
+            let outputs = processor.processChunkOutputs(content)
+            if inferredMistralToolName == nil {
+                chunks.append(contentsOf: outputs.map(responseChunk))
+            } else {
+                pendingMistralOutputs.append(contentsOf: outputs)
+            }
+            return chunks
+        }
+    }
+
+    mutating func finish() -> [ChatResponseChunk] {
+        guard let processor else { return [] }
+        let eosOutputs = processor.processEOSOutputs()
+        guard let toolName = inferredMistralToolName else {
+            return eosOutputs.map(responseChunk)
+        }
+
+        let outputs = pendingMistralOutputs + eosOutputs
+        pendingMistralOutputs.removeAll(keepingCapacity: true)
+        guard !outputs.contains(where: { output in
+            if case .toolCall = output { true } else { false }
+        }) else {
+            return outputs.map(responseChunk)
+        }
+
+        let text = outputs.reduce(into: "") { result, output in
+            if case let .response(value) = output { result += value }
+        }
+        guard let arguments = bareToolArguments(from: text, toolName: toolName) else {
+            return outputs.map(responseChunk)
+        }
+        return [.tool(ToolRequest(name: toolName, args: arguments))]
+    }
+
+    private func bareToolArguments(from text: String, toolName: String) -> String? {
+        guard let data = text.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+
+        let arguments: [String: Any]
+        if object["name"] as? String == toolName,
+           let nested = object["arguments"] as? [String: Any]
+        {
+            arguments = nested
+        } else {
+            arguments = object
+        }
+        guard let normalized = try? JSONSerialization.data(
+            withJSONObject: arguments,
+            options: [.sortedKeys]
+        ) else { return nil }
+        return String(data: normalized, encoding: .utf8)
+    }
+}
+
+@available(iOS 17.0, macOS 14.0, macCatalyst 17.0, *)
+func responseChunks(
+    from generatedChunk: ChatCompletionChunk,
+    toolProcessor: ToolCallProcessor?
+) -> [ChatResponseChunk] {
+    generatedChunk.choices.flatMap { choice in
+        var chunks: [ChatResponseChunk] = []
+        if let reasoning = choice.delta.reasoningContent {
+            chunks.append(.reasoning(reasoning))
+        }
+        if let content = choice.delta.content {
+            if let toolProcessor {
+                chunks.append(contentsOf: toolProcessor.processChunkOutputs(content).map(responseChunk))
+            } else {
+                chunks.append(.text(content))
+            }
+        }
+        return chunks
+    }
+}
+
+@available(iOS 17.0, macOS 14.0, macCatalyst 17.0, *)
+func responseChunk(from output: ToolCallProcessor.Output) -> ChatResponseChunk {
+    switch output {
+    case let .response(text):
+        .text(text)
+    case let .toolCall(toolCall):
+        .tool(ToolRequest(
+            id: toolCall.id,
+            name: toolCall.function.name,
+            args: toolCallArgsToJSON(toolCall.function.arguments)
+        ))
     }
 }
 

@@ -21,7 +21,10 @@ public class MLXChatClient: ChatService, @unchecked Sendable {
         preferredKind: MLXModelKind = .llm,
         coordinator: MLXModelCoordinating = MLXModelCoordinator.shared
     ) {
-        modelConfiguration = .init(directory: url)
+        modelConfiguration = .init(
+            directory: url,
+            toolCallFormat: MLXToolCallFormatDetector.detect(in: url)
+        )
         self.preferredKind = preferredKind
         self.coordinator = coordinator
     }
