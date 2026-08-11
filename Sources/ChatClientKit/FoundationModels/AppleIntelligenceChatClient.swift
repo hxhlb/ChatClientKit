@@ -98,7 +98,9 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
         let tools = tools ?? []
         guard case let .function(selectedName) = choice else {
             if case .required = choice, tools.isEmpty {
-                throw invalidToolChoiceError("A required tool choice needs at least one tool.")
+                throw invalidToolChoiceError(
+                    String(localized: "A required tool choice needs at least one tool.")
+                )
             }
             return tools
         }
@@ -107,7 +109,8 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
             guard case let .function(name, _, _, _) = tool else { return false }
             return name == selectedName
         }) else {
-            throw invalidToolChoiceError("The selected tool '\(selectedName)' is not available.")
+            let key: String.LocalizationValue = "The selected tool '\(selectedName)' is not available."
+            throw invalidToolChoiceError(String(localized: key))
         }
         return [selected]
     }

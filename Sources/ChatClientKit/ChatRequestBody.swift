@@ -342,6 +342,7 @@ public extension ChatRequestBody {
             toolChoice: toolChoice
         )
         merged.model = model
+        merged.preservesReasoningContent = preservesReasoningContent
         merged.stream = stream
         return merged
     }

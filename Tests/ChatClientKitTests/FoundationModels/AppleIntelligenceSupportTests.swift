@@ -117,21 +117,68 @@ struct AppleIntelligencePromptBuilderTests {
 struct AppleIntelligenceToolProxyTests {
     @Test
     @available(iOS 26.0, macOS 26, macCatalyst 26.0, *)
-    func `Tool proxy captures invocation`() async throws {
-        let proxy = AppleIntelligenceToolProxy(
+    func `Tool proxy preserves its schema and captures native arguments`() async throws {
+        let proxy = try AppleIntelligenceToolProxy(
             name: "lookupWeather",
             description: "Fetch latest weather info.",
-            schemaDescription: nil
+            parameters: [
+                "type": "object",
+                "properties": [
+                    "city": [
+                        "type": "string",
+                        "description": "City name",
+                    ],
+                ],
+                "required": ["city"],
+                "additionalProperties": false,
+            ]
         )
+        let encodedSchema = String(
+            decoding: try JSONEncoder().encode(proxy.parameters),
+            as: UTF8.self
+        )
+        #expect(encodedSchema.contains(#""city""#))
+        #expect(encodedSchema.contains(#""required""#))
 
         do {
-            _ = try await proxy.call(arguments: .init(payload: #"{"city":"Paris"}"#))
+            _ = try await proxy.call(
+                arguments: GeneratedContent(properties: ["city": "Paris"])
+            )
             Issue.record("Expected invocation capture error")
         } catch let AppleIntelligenceToolError.invocationCaptured(request) {
             #expect(request.name == "lookupWeather")
             #expect(request.args == #"{"city":"Paris"}"#)
         } catch {
             Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @Test
+    @available(iOS 26.0, macOS 26, macCatalyst 26.0, *)
+    func `Specific tool choice exposes only the selected function`() throws {
+        let client = AppleIntelligenceChatClient()
+        let tools: [ChatRequestBody.Tool] = [
+            .function(name: "weather", description: nil, parameters: nil, strict: nil),
+            .function(name: "calendar", description: nil, parameters: nil, strict: nil),
+        ]
+
+        let selected = try client.selectTools(tools, choice: .function(name: "calendar"))
+
+        #expect(selected.count == 1)
+        guard case let .function(name, _, _, _) = selected[0] else {
+            Issue.record("Expected a function tool")
+            return
+        }
+        #expect(name == "calendar")
+    }
+
+    @Test
+    @available(iOS 26.0, macOS 26, macCatalyst 26.0, *)
+    func `Required tool choice rejects an empty tool list`() {
+        let client = AppleIntelligenceChatClient()
+
+        #expect(throws: Error.self) {
+            _ = try client.selectTools([], choice: .required)
         }
     }
 }

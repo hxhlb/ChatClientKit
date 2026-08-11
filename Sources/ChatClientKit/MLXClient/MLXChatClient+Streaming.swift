@@ -33,8 +33,6 @@ extension MLXChatClient {
             let input = try await context.processor.prepare(input: lockedInput)
 
             let toolCallFormat = context.configuration.toolCallFormat ?? .json
-            let maxCompletionTokens = body.maxCompletionTokens ?? 4096
-
             let streamInput = UnsafeSendableBox(input)
             let streamContext = UnsafeSendableBox(context)
             let streamParameters = generateParameters
@@ -54,10 +52,8 @@ extension MLXChatClient {
                     }
 
                     var latestOutputLength = 0
-                    var isReasoning = false
                     var shouldRemoveLeadingWhitespace = true
-                    var decoder = ChunkDecoder(context: context)
-                    var regularContentOutputLength = 0
+                    var decoder = ChunkDecoder(context: context, input: input)
 
                     do {
                         let (tokenStream, generationTask) = try MLXLMCommon.generateTokensTask(
@@ -83,16 +79,10 @@ extension MLXChatClient {
                             let decodeResult = decoder.decode(
                                 tokens: generatedTokens,
                                 latestOutputLength: &latestOutputLength,
-                                isReasoning: &isReasoning,
                                 shouldRemoveLeadingWhitespace: &shouldRemoveLeadingWhitespace
                             )
 
                             if let generatedChunk = decodeResult.chunk {
-                                if !isReasoning {
-                                    regularContentOutputLength += generatedChunk.choices
-                                        .compactMap(\.delta.content?.count)
-                                        .reduce(0, +)
-                                }
                                 for choice in generatedChunk.choices {
                                     if let reasoning = choice.delta.reasoningContent {
                                         continuation.yield(ChatResponseChunk.reasoning(reasoning))
@@ -109,8 +99,8 @@ extension MLXChatClient {
                                 }
                             }
 
-                            if decodeResult.shouldStop || regularContentOutputLength >= maxCompletionTokens {
-                                logger.info("reached max completion tokens: \(regularContentOutputLength)")
+                            if decodeResult.shouldStop {
+                                logger.info("reached an additional terminating token")
                                 generationTask.cancel()
                                 break generationLoop
                             }
@@ -121,7 +111,6 @@ extension MLXChatClient {
                         if let finalChunk = decoder.makeChunk(
                             text: output,
                             previousLength: latestOutputLength,
-                            isReasoning: isReasoning,
                             shouldRemoveLeadingWhitespace: &shouldRemoveLeadingWhitespace
                         ) {
                             for choice in finalChunk.choices {
@@ -139,6 +128,24 @@ extension MLXChatClient {
                                 }
                             }
                         }
+                        if let finalChunk = decoder.finalize(
+                            shouldRemoveLeadingWhitespace: &shouldRemoveLeadingWhitespace
+                        ) {
+                            for choice in finalChunk.choices {
+                                if let reasoning = choice.delta.reasoningContent {
+                                    continuation.yield(.reasoning(reasoning))
+                                }
+                                if let content = choice.delta.content {
+                                    if let toolProcessor {
+                                        if let passthrough = toolProcessor.processChunk(content) {
+                                            continuation.yield(.text(passthrough))
+                                        }
+                                    } else {
+                                        continuation.yield(.text(content))
+                                    }
+                                }
+                            }
+                        }
 
                         if let toolProcessor {
                             for toolCall in toolProcessor.toolCalls {
@@ -151,7 +158,7 @@ extension MLXChatClient {
                             }
                         }
 
-                        logger.info("inference completed, total output length: \(output.count), regular content: \(regularContentOutputLength)")
+                        logger.info("inference completed, total output length: \(output.count)")
                         continuation.finish()
                     } catch is CancellationError {
                         logger.debug("inference cancelled for token: \(token.uuidString)")
@@ -182,11 +189,27 @@ struct ChunkDecodeResult {
 @available(iOS 17.0, macOS 14.0, macCatalyst 17.0, *)
 struct ChunkDecoder {
     let context: ModelContext
+    var reasoningEmitter: ReasoningEventEmitter?
+
+    init(context: ModelContext, input: LMInput) {
+        self.context = context
+        guard let config = context.configuration.reasoningConfig else { return }
+
+        let promptTokens = input.text.tokens.asArray(Int.self)
+        let prompt = context.tokenizer.decode(tokenIds: promptTokens)
+        let primedInside = ReasoningEventEmitter.promptEndsInsideReasoning(
+            renderedPromptTail: prompt,
+            config: config
+        )
+        reasoningEmitter = ReasoningEventEmitter(
+            config: config,
+            primedInside: primedInside
+        )
+    }
 
     mutating func decode(
         tokens: [Int],
         latestOutputLength: inout Int,
-        isReasoning: inout Bool,
         shouldRemoveLeadingWhitespace: inout Bool
     ) -> ChunkDecodeResult {
         var text = context.tokenizer.decode(tokenIds: tokens)
@@ -197,15 +220,9 @@ struct ChunkDecoder {
             text.removeLast(MLXChatClient.decoderErrorSuffix.count)
         }
 
-        if toggleReasoningIfNeeded(lastToken: tokens.last, isReasoning: &isReasoning) {
-            shouldRemoveLeadingWhitespace = true
-            return .init(chunk: nil, shouldStop: false)
-        }
-
         let chunk = makeChunk(
             text: text,
             previousLength: previousLength,
-            isReasoning: isReasoning,
             shouldRemoveLeadingWhitespace: &shouldRemoveLeadingWhitespace
         )
 
@@ -225,48 +242,72 @@ struct ChunkDecoder {
         return .init(chunk: chunk, shouldStop: shouldStop)
     }
 
-    func toggleReasoningIfNeeded(lastToken: Int?, isReasoning: inout Bool) -> Bool {
-        guard let lastToken else { return false }
-        let text = context.tokenizer.decode(tokenIds: [lastToken]).trimmingCharacters(in: .whitespacesAndNewlines)
-        if !isReasoning, text == ChatClientConstants.reasoningDecoderBegin {
-            logger.info("starting reasoning with token \(text)")
-            isReasoning = true
-            return true
-        }
-        if isReasoning, text == ChatClientConstants.reasoningDecoderEnd {
-            logger.info("end reasoning with token \(text)")
-            isReasoning = false
-            return true
-        }
-        return false
-    }
-
-    func makeChunk(
+    mutating func makeChunk(
         text: String,
         previousLength: Int,
-        isReasoning: Bool,
         shouldRemoveLeadingWhitespace: inout Bool
     ) -> ChatCompletionChunk? {
         guard previousLength < text.count else { return nil }
         let chunkRange = previousLength ..< text.count
         let startIndex = text.index(text.startIndex, offsetBy: chunkRange.lowerBound)
         let endIndex = text.index(text.startIndex, offsetBy: chunkRange.upperBound)
-        var chunkContent = String(text[startIndex ..< endIndex])
+        let chunkContent = String(text[startIndex ..< endIndex])
 
-        if shouldRemoveLeadingWhitespace {
-            chunkContent = chunkContent.trimmingCharactersFromStart(in: .whitespacesAndNewlines)
-            shouldRemoveLeadingWhitespace = chunkContent.isEmpty
-        }
-
-        guard !chunkContent.isEmpty else { return nil }
-
-        let delta = if isReasoning {
-            ChatCompletionChunk.Choice.Delta(reasoningContent: chunkContent)
+        let segments: [ReasoningEventEmitter.Segment]
+        if var reasoningEmitter {
+            segments = reasoningEmitter.process(chunkContent)
+            self.reasoningEmitter = reasoningEmitter
         } else {
-            ChatCompletionChunk.Choice.Delta(content: chunkContent)
+            segments = [.response(chunkContent)]
         }
-        let choice: ChatCompletionChunk.Choice = .init(delta: delta)
-        return .init(choices: [choice])
+        return makeChunk(
+            segments: segments,
+            shouldRemoveLeadingWhitespace: &shouldRemoveLeadingWhitespace
+        )
+    }
+
+    mutating func finalize(
+        shouldRemoveLeadingWhitespace: inout Bool
+    ) -> ChatCompletionChunk? {
+        guard var reasoningEmitter else { return nil }
+        let segments = reasoningEmitter.finalize()
+        self.reasoningEmitter = reasoningEmitter
+        return makeChunk(
+            segments: segments,
+            shouldRemoveLeadingWhitespace: &shouldRemoveLeadingWhitespace
+        )
+    }
+
+    private func makeChunk(
+        segments: [ReasoningEventEmitter.Segment],
+        shouldRemoveLeadingWhitespace: inout Bool
+    ) -> ChatCompletionChunk? {
+        let choices = segments.compactMap { segment -> ChatCompletionChunk.Choice? in
+            var text: String
+            let isReasoning: Bool
+            switch segment {
+            case let .reasoning(value):
+                text = value
+                isReasoning = true
+            case let .response(value):
+                text = value
+                isReasoning = false
+            }
+
+            if shouldRemoveLeadingWhitespace {
+                text = text.trimmingCharactersFromStart(in: .whitespacesAndNewlines)
+                shouldRemoveLeadingWhitespace = text.isEmpty
+            }
+            guard !text.isEmpty else { return nil }
+
+            let delta = if isReasoning {
+                ChatCompletionChunk.Choice.Delta(reasoningContent: text)
+            } else {
+                ChatCompletionChunk.Choice.Delta(content: text)
+            }
+            return .init(delta: delta)
+        }
+        return choices.isEmpty ? nil : .init(choices: choices)
     }
 }
 

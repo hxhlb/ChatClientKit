@@ -106,6 +106,7 @@ extension MLXChatClient {
 
     func generateParameters(body: ChatRequestBody) -> GenerateParameters {
         var parameters = GenerateParameters()
+        parameters.maxTokens = max(body.maxCompletionTokens ?? 4096, 1)
         if let temperature = body.temperature {
             parameters.temperature = Float(temperature)
         }
