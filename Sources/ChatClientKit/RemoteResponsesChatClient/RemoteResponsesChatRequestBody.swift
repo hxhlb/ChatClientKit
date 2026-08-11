@@ -15,6 +15,7 @@ struct ResponsesRequestBody: Encodable {
     let temperature: Double?
     let maxOutputTokens: Int?
     let tools: [Tool]?
+    let toolChoice: ToolChoice?
 
     enum CodingKeys: String, CodingKey {
         case model
@@ -24,6 +25,41 @@ struct ResponsesRequestBody: Encodable {
         case temperature
         case maxOutputTokens = "max_output_tokens"
         case tools
+        case toolChoice = "tool_choice"
+    }
+}
+
+extension ResponsesRequestBody {
+    /// Responses API `tool_choice`: modes stay bare strings, a specific
+    /// function uses the flat `{"type": "function", "name": ...}` object.
+    enum ToolChoice: Encodable {
+        case mode(String)
+        case function(name: String)
+
+        init(_ choice: ChatRequestBody.ToolChoice) {
+            switch choice {
+            case .auto: self = .mode("auto")
+            case .required: self = .mode("required")
+            case let .function(name): self = .function(name: name)
+            }
+        }
+
+        enum RootKey: CodingKey {
+            case type
+            case name
+        }
+
+        func encode(to encoder: any Encoder) throws {
+            switch self {
+            case let .mode(value):
+                var container = encoder.singleValueContainer()
+                try container.encode(value)
+            case let .function(name):
+                var container = encoder.container(keyedBy: RootKey.self)
+                try container.encode("function", forKey: .type)
+                try container.encode(name, forKey: .name)
+            }
+        }
     }
 }
 
@@ -201,7 +237,8 @@ struct ResponsesRequestTransformer {
             stream: stream,
             temperature: chatBody.temperature,
             maxOutputTokens: chatBody.maxCompletionTokens,
-            tools: chatBody.tools?.map(ResponsesRequestBody.Tool.init)
+            tools: chatBody.tools?.map(ResponsesRequestBody.Tool.init),
+            toolChoice: chatBody.toolChoice.map(ResponsesRequestBody.ToolChoice.init)
         )
     }
 }

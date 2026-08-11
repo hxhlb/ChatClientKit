@@ -1,5 +1,12 @@
 import Foundation
 
+public extension CodingUserInfoKey {
+    /// Set to `true` on an encoder to make assistant messages emit their
+    /// stored reasoning as `reasoning_content`. See
+    /// ``ChatRequestBody/preservesReasoningContent``.
+    static let preservesReasoningContent = CodingUserInfoKey(rawValue: "preservesReasoningContent")!
+}
+
 public struct ChatRequestBody: Sendable, Encodable {
     public var model: String?
     public var messages: [Message]
@@ -7,6 +14,14 @@ public struct ChatRequestBody: Sendable, Encodable {
     public var stream: Bool?
     public var temperature: Double?
     public var tools: [Tool]?
+    public var toolChoice: ToolChoice?
+
+    /// Client-side switch, never serialized itself: when true, assistant turns
+    /// carry their stored reasoning back to the provider as
+    /// `reasoning_content`. Off by default because some providers (DeepSeek)
+    /// reject echoed reasoning, while preserved-thinking models (Kimi K-series)
+    /// require it.
+    public var preservesReasoningContent: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case model
@@ -15,6 +30,7 @@ public struct ChatRequestBody: Sendable, Encodable {
         case stream
         case temperature
         case tools
+        case toolChoice = "tool_choice"
     }
 
     public init(
@@ -23,7 +39,8 @@ public struct ChatRequestBody: Sendable, Encodable {
         maxCompletionTokens: Int? = nil,
         stream: Bool? = nil,
         temperature: Double? = nil,
-        tools: [Tool]? = nil
+        tools: [Tool]? = nil,
+        toolChoice: ToolChoice? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -31,6 +48,47 @@ public struct ChatRequestBody: Sendable, Encodable {
         self.stream = stream
         self.temperature = temperature
         self.tools = tools
+        self.toolChoice = toolChoice
+    }
+}
+
+public extension ChatRequestBody {
+    /// Wire-level `tool_choice`. `auto`/`required` encode as bare strings,
+    /// a specific function encodes as the object form of the completions API.
+    enum ToolChoice: Sendable, Equatable {
+        case auto
+        case required
+        case function(name: String)
+    }
+}
+
+extension ChatRequestBody.ToolChoice: Encodable {
+    enum RootKey: CodingKey {
+        case type
+        case function
+    }
+
+    enum FunctionKey: CodingKey {
+        case name
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        switch self {
+        case .auto:
+            var container = encoder.singleValueContainer()
+            try container.encode("auto")
+        case .required:
+            var container = encoder.singleValueContainer()
+            try container.encode("required")
+        case let .function(name):
+            var container = encoder.container(keyedBy: RootKey.self)
+            try container.encode("function", forKey: .type)
+            var functionContainer = container.nestedContainer(
+                keyedBy: FunctionKey.self,
+                forKey: .function
+            )
+            try functionContainer.encode(name, forKey: .name)
+        }
     }
 }
 
@@ -76,6 +134,7 @@ public extension ChatRequestBody {
             case content
             case name
             case role
+            case reasoningContent = "reasoning_content"
             case toolCallID = "tool_call_id"
             case toolCalls = "tool_calls"
         }
@@ -84,14 +143,21 @@ public extension ChatRequestBody {
             var container = encoder.container(keyedBy: RootKey.self)
             try container.encode(role, forKey: .role)
             switch self {
-            case let .assistant(content, toolCalls, _):
-                // Reasoning is intentionally not transmitted: the OpenAI
+            case let .assistant(content, toolCalls, reasoning):
+                // Reasoning is not transmitted by default: the OpenAI
                 // chat-completions wire schema rejects it on assistant turns,
                 // and providers like DeepSeek explicitly fail when prior
-                // reasoning is echoed back. The domain model retains it for
-                // local persistence and UI; the encoder simply drops it.
+                // reasoning is echoed back. Preserved-thinking models (Kimi
+                // K-series) require the opposite, so the request opts in via
+                // `ChatRequestBody.preservesReasoningContent`, delivered here
+                // through the encoder's userInfo.
                 try container.encodeIfPresent(content, forKey: .content)
                 try container.encodeIfPresent(toolCalls, forKey: .toolCalls)
+                if encoder.userInfo[.preservesReasoningContent] as? Bool == true,
+                   let reasoning, !reasoning.isEmpty
+                {
+                    try container.encode(reasoning, forKey: .reasoningContent)
+                }
             case let .developer(content, name):
                 try container.encode(content, forKey: .content)
                 try container.encodeIfPresent(name, forKey: .name)
@@ -272,7 +338,8 @@ public extension ChatRequestBody {
             maxCompletionTokens: maxCompletionTokens,
             stream: stream,
             temperature: temperature,
-            tools: tools
+            tools: tools,
+            toolChoice: toolChoice
         )
         merged.model = model
         merged.stream = stream

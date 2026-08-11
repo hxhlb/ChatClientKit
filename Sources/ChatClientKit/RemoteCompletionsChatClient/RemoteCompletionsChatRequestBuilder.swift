@@ -64,6 +64,7 @@ struct RemoteCompletionsChatRequestBuilder {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        encoder.userInfo[.preservesReasoningContent] = body.preservesReasoningContent
         request.httpBody = try encoder.encode(body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 

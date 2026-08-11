@@ -47,17 +47,17 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
         body: ChatRequestBody,
         persona: String
     ) throws -> SessionContext {
-        let additionalInstructions = toolUsageInstructions(hasTools: !(body.tools ?? []).isEmpty)
+        let selectedTools = try selectTools(body.tools, choice: body.toolChoice)
+        let tools = try makeToolProxies(from: selectedTools)
 
         let instructionText = AppleIntelligencePromptBuilder.makeInstructions(
             persona: persona,
             messages: body.messages,
-            additionalDirectives: additionalInstructions
+            additionalDirectives: toolChoiceInstructions(body.toolChoice)
         )
 
         let prompt = AppleIntelligencePromptBuilder.makePrompt(from: body.messages)
 
-        let tools = makeToolProxies(from: body.tools)
         let session = if tools.isEmpty {
             LanguageModelSession(instructions: instructionText)
         } else {
@@ -70,52 +70,88 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
         let clampedTemperature = clampTemperature(
             body.temperature ?? configuration.defaultTemperature
         )
-        let options = GenerationOptions(temperature: clampedTemperature)
+        let maximumResponseTokens = body.maxCompletionTokens.flatMap { value in
+            value > 0 ? value : nil
+        }
+        var options = GenerationOptions(
+            temperature: clampedTemperature,
+            maximumResponseTokens: maximumResponseTokens
+        )
+        if #available(iOS 27.0, macOS 27.0, macCatalyst 27.0, *) {
+            switch body.toolChoice {
+            case .required, .function:
+                options.toolCallingMode = .required
+            case .auto:
+                options.toolCallingMode = tools.isEmpty ? nil : .allowed
+            case nil:
+                break
+            }
+        }
 
         return SessionContext(session: session, prompt: prompt, options: options)
     }
 
+    func selectTools(
+        _ tools: [ChatRequestBody.Tool]?,
+        choice: ChatRequestBody.ToolChoice?
+    ) throws -> [ChatRequestBody.Tool] {
+        let tools = tools ?? []
+        guard case let .function(selectedName) = choice else {
+            if case .required = choice, tools.isEmpty {
+                throw invalidToolChoiceError("A required tool choice needs at least one tool.")
+            }
+            return tools
+        }
+
+        guard let selected = tools.first(where: { tool in
+            guard case let .function(name, _, _, _) = tool else { return false }
+            return name == selectedName
+        }) else {
+            throw invalidToolChoiceError("The selected tool '\(selectedName)' is not available.")
+        }
+        return [selected]
+    }
+
     func makeToolProxies(
-        from tools: [ChatRequestBody.Tool]?
-    ) -> [any Tool] {
-        guard let tools, !tools.isEmpty else { return [] }
-        return tools.compactMap { tool -> (any Tool)? in
+        from tools: [ChatRequestBody.Tool]
+    ) throws -> [any Tool] {
+        try tools.map { tool -> any Tool in
             switch tool {
             case let .function(name, description, parameters, _):
-                let schemaDescription = renderSchemaDescription(parameters)
-                return AppleIntelligenceToolProxy(
+                return try AppleIntelligenceToolProxy(
                     name: name,
                     description: description,
-                    schemaDescription: schemaDescription
+                    parameters: parameters
                 ) as any Tool
             }
         }
     }
 
-    func renderSchemaDescription(
-        _ parameters: [String: AnyCodingValue]?
-    ) -> String? {
-        guard let parameters else { return nil }
-        guard let data = try? JSONEncoder.stableRequestEncoder.encode(parameters) else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
-    func toolUsageInstructions(hasTools: Bool) -> [String] {
-        guard hasTools else {
-            return [
-                "No tools are available for this task, so answer the user directly without attempting any tool calls.",
-            ]
+    func toolChoiceInstructions(_ choice: ChatRequestBody.ToolChoice?) -> [String] {
+        switch choice {
+        case .required:
+            ["Call one of the available tools before answering the user."]
+        case let .function(name):
+            ["Call the \(name) tool. Do not answer the user directly."]
+        case .auto, nil:
+            []
         }
-        return [
-            "Explain why you intend to call a tool and what you expect it to produce before making the request, only use one when it truly helps the user, and feel free to proceed without any tool if that is better.",
-        ]
     }
 
     func clampTemperature(_ value: Double) -> Double {
-        if value.isNaN || !value.isFinite {
-            return configuration.defaultTemperature
-        }
+        let fallback = configuration.defaultTemperature.isFinite
+            ? configuration.defaultTemperature
+            : 0.75
+        guard value.isFinite else { return min(max(fallback, 0), 2) }
         return min(max(value, 0), 2)
+    }
+
+    private func invalidToolChoiceError(_ description: String) -> NSError {
+        NSError(
+            domain: "AppleIntelligence",
+            code: -2,
+            userInfo: [NSLocalizedDescriptionKey: description]
+        )
     }
 
     func makeStreamingSequence(
