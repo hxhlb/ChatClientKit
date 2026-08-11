@@ -92,10 +92,9 @@ struct MLXChatClientQueueTests {
         #expect(acquiredAfterRelease == true)
     }
 
-    @Test(.enabled(if: TestHelpers.checkGPU()))
+    @Test(.enabled(if: TestHelpers.isMLXModelAvailable))
     func `Queue allows only a single MLX inference at a time`() async throws {
         guard #available(iOS 17.0, macOS 14.0, macCatalyst 17.0, *) else { return }
-        guard TestHelpers.checkGPU() else { return }
 
         let modelURL = TestHelpers.fixtureURLOrSkip(named: "mlx_testing_model")
         let client = MLXChatClient(url: modelURL, preferredKind: .llm, coordinator: MLXModelCoordinator())

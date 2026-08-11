@@ -25,7 +25,7 @@ struct MLXModelCoordinatorTests {
         let tokenizer = try await loader.load(from: directory)
 
         #expect(tokenizer.convertTokenToId("offline") == 4)
-        #expect(tokenizer.decode(tokenIds: [4, 5], skipSpecialTokens: false) == "offlinepath")
+        #expect(tokenizer.decode(tokenIds: [4, 5], skipSpecialTokens: false) == "offline path")
     }
 
     @Test

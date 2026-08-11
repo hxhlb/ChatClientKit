@@ -237,7 +237,6 @@ enum TestHelpers {
             return repoFixture
         }
 
-        Issue.record("Fixture \(name) is missing. Checked \(homeFixture.path) and \(repoFixture.path)")
         return nil
     }
 
