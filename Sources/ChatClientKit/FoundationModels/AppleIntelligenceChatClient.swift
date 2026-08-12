@@ -73,20 +73,10 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
         let maximumResponseTokens = body.maxCompletionTokens.flatMap { value in
             value > 0 ? value : nil
         }
-        var options = GenerationOptions(
+        let options = GenerationOptions(
             temperature: clampedTemperature,
             maximumResponseTokens: maximumResponseTokens
         )
-        if #available(iOS 27.0, macOS 27.0, macCatalyst 27.0, *) {
-            switch body.toolChoice {
-            case .required, .function:
-                options.toolCallingMode = .required
-            case .auto:
-                options.toolCallingMode = tools.isEmpty ? nil : .allowed
-            case nil:
-                break
-            }
-        }
 
         return SessionContext(session: session, prompt: prompt, options: options)
     }

@@ -209,6 +209,7 @@ struct AppleIntelligenceToolProxyTests {
             return
         }
         #expect(name == "calendar")
+        #expect(body.toolChoiceDirective == "Call the calendar tool. Do not answer the user directly.")
     }
 
     @Test
@@ -219,28 +220,21 @@ struct AppleIntelligenceToolProxyTests {
         #expect(throws: Error.self) {
             _ = try body.selectedTools()
         }
+        #expect(body.toolChoiceDirective == "Call one of the available tools before answering the user.")
     }
 
     @Test
-    @available(iOS 27.0, macOS 27.0, macCatalyst 27.0, *)
-    func `Required tool choice reaches native generation options`() throws {
+    @available(iOS 26.0, macOS 26.0, macCatalyst 26.0, *)
+    func `Session context preserves maximum response tokens`() throws {
         let client = AppleIntelligenceChatClient()
         let body = ChatRequestBody(
             messages: [.user(content: .text("Check Paris weather"))],
-            maxCompletionTokens: 48,
-            tools: [.function(
-                name: "weather",
-                description: "Look up weather.",
-                parameters: nil,
-                strict: nil
-            )],
-            toolChoice: .function(name: "weather")
+            maxCompletionTokens: 48
         )
 
         let context = try client.makeSessionContext(body: body, persona: "")
 
         #expect(context.options.maximumResponseTokens == 48)
-        #expect(context.options.toolCallingMode == .required)
     }
 }
 
